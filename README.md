@@ -36,13 +36,13 @@ C++/CLI 薄胶层，将 **Open CASCADE Technology (OCCT)** 以**静态链接**�
    - Win32 / XP：`XP\OcctWrapperXP.vcxproj`
 2. 选择 **Release | x64**（或 **Release | Win32**）构建。
 3. 产物：
-   - x64 → `bin\Debug\Components\Platform.Component.OCCTWrapper.dll`
+   - x64 → `bin\Debug\Components\OCCT_X64\Platform.Component.OCCTWrapper.dll`
    - Win32 → `bin\Debug\Components\OCCT_X86\Platform.Component.OCCTWrapper.dll`
 
 ## 重新链接（替换组件）
 
 更新 OCCT 版本或修改本组件后，用新编译的 `Platform.Component.OCCTWrapper.dll` 替换部署目录中对应位数的文件即可：
-- x64 替换 `Components\` 下
+- x64 替换 `Components\OCCT_X64\` 下
 - Win32 替换 `Components\OCCT_X86\` 下
 
 本组件**不随包分发任何 OCCT 动态库（TK\*.dll）**——OCCT 已静态链入本 DLL（导入表中无任何 `TK*.dll`）。
