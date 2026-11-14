@@ -1,0 +1,68 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!-- XP/32 位专用 Wrapper：v140_xp + OCCT 7.3，输出到 Components\OCCT_X86\。
+       与同级 v143 工程完全独立、共用同一批 .cpp/.h，互不影响（A 线不动）。
+       程序集名仍为 Platform.Component.OCCTWrapper —— C# 是编译期强引用，
+       改名会破坏 CLR 按简单名称绑定，故只按目录区分位数。 -->
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>14.0</VCProjectVersion>
+    <ProjectGuid>{C2F7A9D4-3B61-4E58-9A20-7D5E8B1C4F36}</ProjectGuid>
+    <RootNamespace>OCCTWrapperXP</RootNamespace>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v140_xp</PlatformToolset>
+    <CLRSupport>true</CLRSupport>
+    <TargetFrameworkVersion>v4.0</TargetFrameworkVersion>
+    <CharacterSet>Unicode</CharacterSet>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <TargetName>Platform.Component.OCCTWrapper</TargetName>
+    <OutDir>$(SolutionDir)bin\Debug\Components\OCCT_X86\</OutDir>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+      <!-- OCCT 7.3 是 C++11 时代代码：不能用 stdcpp17。 -->
+      <PreprocessorDefinitions>WIN32;_WINDOWS;_USRDLL;NDEBUG;USE_OCCT;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- 由 OCCT 7.3 CMake INSTALL 生成的 inc；如实际路径不同，改这一行即可。 -->
+      <AdditionalIncludeDirectories>D:\VC\OCCT\install_xp73\inc;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalOptions>/bigobj %(AdditionalOptions)</AdditionalOptions>
+      <Optimization>MaxSpeed</Optimization>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <InlineFunctionExpansion>AnySuitable</InlineFunctionExpansion>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
+      <OmitFramePointers>true</OmitFramePointers>
+      <DebugInformationFormat>None</DebugInformationFormat>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <!-- OCCT 7.3 用 v140_xp 编出的 TK*.lib（静态库/导入库）目录。 -->
+      <AdditionalLibraryDirectories>D:\VC\OCCT\install_xp73\win32\vc14\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <GenerateDebugInformation>false</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClInclude Include="..\Dwg2DViewer.h" />
+    <ClInclude Include="..\OcctBrepReader.h" />
+    <ClInclude Include="..\OcctViewer.h" />
+    <ClCompile Include="..\Dwg2DViewer.cpp" />
+    <ClCompile Include="..\OcctBrepReader.cpp" />
+    <ClCompile Include="..\OcctViewer.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <Reference Include="System" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

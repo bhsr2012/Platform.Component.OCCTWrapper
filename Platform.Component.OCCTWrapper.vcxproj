@@ -1,0 +1,129 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|Win32">
+      <Configuration>Debug</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <ProjectGuid>{1FE384FB-FA54-43F5-8C3B-520AFA12F8B1}</ProjectGuid>
+    <RootNamespace>OCCTWrapper</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CLRSupport>true</CLRSupport>
+    <TargetFrameworkVersion>v4.0</TargetFrameworkVersion>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CLRSupport>true</CLRSupport>
+    <TargetFrameworkVersion>v4.0</TargetFrameworkVersion>
+    <CharacterSet>Unicode</CharacterSet>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CLRSupport>true</CLRSupport>
+    <TargetFrameworkVersion>v4.0</TargetFrameworkVersion>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CLRSupport>true</CLRSupport>
+    <TargetFrameworkVersion>v4.0</TargetFrameworkVersion>
+    <CharacterSet>Unicode</CharacterSet>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <TargetName>Platform.Component.OCCTWrapper</TargetName>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Debug'">
+    <OutDir>$(SolutionDir)bin\Debug\Components\</OutDir>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Release'">
+    <OutDir>$(SolutionDir)bin\Release\Components\</OutDir>
+  </PropertyGroup>
+  <!-- 32 位 Wrapper 单独落到 OCCT_X86：根目录的 x64 Wrapper 是 C# 编译期强引用，必须保持原位。 -->
+  <PropertyGroup Condition="'$(Platform)'=='Win32'">
+    <OutDir>$(SolutionDir)bin\Debug\Components\OCCT_X86\</OutDir>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+      <!-- USE_OCCT：真 OCCT 实现，当前采用【动态链接 · 路线 B：自编共享库 + 关第三方】以满足 LGPL 2.1 + Open CASCADE 例外 v1.0 之动态链接/可替换要求。
+           链接：AdditionalLibraryDirectories 指向【自编 OCCT 共享库】导入库目录 D:\VC\OCCT\build\win64\vc14\lib
+           （OCCT 源码以 -DBUILD_LIBRARY_TYPE=Shared 重编，输出 TK*.lib 导入库 + TK*.dll；与旧静态库同路径，仅内容由静态归档变为导入库）。
+           下方 #pragma comment(lib, "TKxxx.lib") 列表即各导入库（依赖方在前、被依赖方在后）。
+           重编 OCCT 时需关闭第三方特性以得纯 LGPL 闭包：-DUSE_FREEIMAGE=OFF -DUSE_FREETYPE=OFF -DUSE_TBB=OFF -DUSE_RAPIDJSON=OFF -DUSE_OPENVR=OFF -DUSE_GL2PS=OFF（视版本增减）。
+           如此 TK*.dll 仅依赖系统 CRT 与 OCCT 内部模块，不引入 FreeImage(GPL)/FFmpeg(LGPL)/freetype/TBB/openvr 等第三方 DLL，闭包最干净。
+           运行时随包部署自编的 TK*.dll 至运行目录 Components\，用户可整包替换，无需重编本程序。
+           头文件用 OCCT 8.0.1 真实头（prebuilt inc，与自编共享库同版本即可）。
+           编译标志：本 wrapper 为薄胶层，Debug/Release 均按 Release 等价标志编（/MD + NDEBUG + /O2，_ITERATOR_DEBUG_LEVEL 与 Release OCCT 一致防 ODR）。 -->
+      <PreprocessorDefinitions>WIN32;_WINDOWS;_USRDLL;NDEBUG;USE_OCCT;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>D:\VC\OCCT\prebuilt\opencascade-8.0.1-vc14-64\inc;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalOptions>/bigobj %(AdditionalOptions)</AdditionalOptions>
+      <!-- OCCT 8.0 CMake 要求 CMAKE_CXX_STANDARD=17，其头文件须以 C++17 编译 -->
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <Optimization>MaxSpeed</Optimization>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <InlineFunctionExpansion Condition="'$(Configuration)|$(Platform)'=='Release|x64'">AnySuitable</InlineFunctionExpansion>
+      <IntrinsicFunctions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</IntrinsicFunctions>
+      <FavorSizeOrSpeed Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Speed</FavorSizeOrSpeed>
+      <OmitFramePointers Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</OmitFramePointers>
+      <DebugInformationFormat Condition="'$(Configuration)|$(Platform)'=='Release|x64'">None</DebugInformationFormat>
+      <EnableFiberSafeOptimizations Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</EnableFiberSafeOptimizations>
+      <DebugInformationFormat Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">None</DebugInformationFormat>
+      <InlineFunctionExpansion Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">AnySuitable</InlineFunctionExpansion>
+      <IntrinsicFunctions Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</IntrinsicFunctions>
+      <FavorSizeOrSpeed Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Speed</FavorSizeOrSpeed>
+      <OmitFramePointers Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</OmitFramePointers>
+      <EnableFiberSafeOptimizations Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</EnableFiberSafeOptimizations>
+      <WholeProgramOptimization Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</WholeProgramOptimization>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <AdditionalLibraryDirectories Condition="'$(Platform)'=='x64'">D:\VC\OCCT\build\win64\vc14\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories Condition="'$(Platform)'=='Win32'">D:\VC\OCCT\build\win32\vc14\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <GenerateDebugInformation Condition="'$(Configuration)|$(Platform)'=='Release|x64'">false</GenerateDebugInformation>
+      <GenerateDebugInformation Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">false</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClInclude Include="Dwg2DViewer.h" />
+    <ClInclude Include="OcctBrepReader.h" />
+    <ClInclude Include="OcctViewer.h" />
+    <ClCompile Include="Dwg2DViewer.cpp" />
+    <ClCompile Include="OcctBrepReader.cpp" />
+    <ClCompile Include="OcctViewer.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <Reference Include="System" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

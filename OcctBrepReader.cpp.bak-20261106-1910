@@ -1,0 +1,1864 @@
+﻿#include "OcctBrepReader.h"
+
+#ifdef USE_OCCT
+// ==================== 真 OCCT 实现（OCCT 8.0.1 官方预编译共享库，D:\VC\OCCT\prebuilt\opencascade-8.0.1-vc14-64） ====================
+#include <vector>
+#include <string>
+#include <cstring>
+#include <cstdio>
+#include <ctime>
+#include <cctype>
+#include <cmath>
+#include <cstdlib>
+#include <chrono>
+#include <algorithm>
+#include <STEPControl_Reader.hxx>
+#include <IGESControl_Reader.hxx>
+#include <BRepTools.hxx>
+#include <BRepMesh_IncrementalMesh.hxx>
+#include <TopExp_Explorer.hxx>
+#include <TopoDS.hxx>
+#include <TopLoc_Location.hxx>
+#include <BRep_Tool.hxx>
+#include <Poly_Triangle.hxx>
+#include <Poly_Triangulation.hxx>
+#include <Bnd_Box.hxx>
+#include <BRepBndLib.hxx>
+#include <TopAbs.hxx>
+#include <BRep_Builder.hxx>
+#include <IFSelect_ReturnStatus.hxx>
+#include <Interface_Static.hxx>
+#include <Resource_FormatType.hxx>
+#include <Standard_Failure.hxx>
+#include <BRepAdaptor_Curve.hxx>
+#include <GeomLProp_SLProps.hxx>
+#include <ShapeAnalysis_Surface.hxx>
+#include <GCPnts_QuasiUniformDeflection.hxx>
+#include <TopExp.hxx>
+#include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
+
+// XCAF（装配树 + 真实部件名）：STEPCAFControl_Reader / IGESCAFControl_Reader 读进
+// TDocStd_Document，再用 XCAFDoc_ShapeTool 遍历装配树取每个零件名与父子层级。
+// 这组头文件与下面的 TKXDE* 导入库在本地 OCCT（build 与 prebuilt 两份）均齐备，
+// 无需重编 OCCT；运行时 TKXDESTEP/TKXDEIGES/TKXCAF 等 DLL 需随包部署（见部署说明）。
+#include <STEPCAFControl_Reader.hxx>
+#include <IGESCAFControl_Reader.hxx>
+#include <TDocStd_Document.hxx>
+#include <XCAFDoc_ShapeTool.hxx>
+#include <XCAFDoc_DocumentTool.hxx>
+#include <TDataStd_Name.hxx>
+#include <NCollection_Sequence.hxx>
+#include <BRepBuilderAPI_Transform.hxx>
+#include <TopTools_IndexedMapOfShape.hxx>
+#include <gp_Pnt.hxx>
+#include <gp_Trsf.hxx>
+#include <gp_Vec.hxx>
+
+// 显式链接 OCCT 动态库导入库（D:\VC\OCCT\build\win64\vc14\lib 下的 TK*.lib 为自编共享库导入库，非静态库）。
+// 闭包来源：各工具包 EXTERNLIB.cmake（TKDESTEP/TKDEIGES/TKMesh/TKBRep/TKXSBase 及其全部传递依赖）。
+// 顺序：依赖方在前、被依赖方在后（MSVC 链接器按序扫描导入库；预编译包已关第三方特性，无 freetype/ffmpeg/tbb 泄漏）。
+// ws2_32 置顶：TKernel（OSD_File/OSD_Host）引用 recv/inet_ntoa/gethostbyname/WSAStartup，须由消费方显式提供且排在 TKernel.lib 之前。
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "TKDESTEP.lib")
+#pragma comment(lib, "TKDEIGES.lib")
+#pragma comment(lib, "TKDE.lib")
+#pragma comment(lib, "TKXSBase.lib")
+#pragma comment(lib, "TKMesh.lib")
+#pragma comment(lib, "TKBool.lib")
+#pragma comment(lib, "TKXCAF.lib")
+// XCAF / XDE 依赖闭包（TKDESTEP/TKDEIGES 读取器 + CAF 基础库）。注意库名无 XDE 前缀，
+// 即 TKDESTEP.lib / TKDEIGES.lib（对应 STEPCAFControl / IGESCAFControl 读取器）。
+// 本地 OCCT（build 与 prebuilt 两份）均提供这些导入库与头文件，无需重编 OCCT；
+// 运行时对应 DLL 需随包部署（TKDESTEP/TKDEIGES/TKXCAF/TKXmlXCAF 等）。
+#pragma comment(lib, "TKDESTEP.lib")
+#pragma comment(lib, "TKDEIGES.lib")
+#pragma comment(lib, "TKBinXCAF.lib")
+#pragma comment(lib, "TKXmlXCAF.lib")
+#pragma comment(lib, "TKCAF.lib")
+#pragma comment(lib, "TKLCAF.lib")
+#pragma comment(lib, "TKCDF.lib")
+#pragma comment(lib, "TKVCAF.lib")
+#pragma comment(lib, "TKCAF.lib")
+#pragma comment(lib, "TKBO.lib")
+#pragma comment(lib, "TKShHealing.lib")
+#pragma comment(lib, "TKTopAlgo.lib")
+#pragma comment(lib, "TKGeomAlgo.lib")
+#pragma comment(lib, "TKPrim.lib")
+#pragma comment(lib, "TKBRep.lib")
+#pragma comment(lib, "TKGeomBase.lib")
+#pragma comment(lib, "TKG3d.lib")
+#pragma comment(lib, "TKG2d.lib")
+#pragma comment(lib, "TKMath.lib")
+#pragma comment(lib, "TKService.lib")
+#pragma comment(lib, "TKLCAF.lib")
+#pragma comment(lib, "TKCDF.lib")
+#pragma comment(lib, "TKernel.lib")
+
+using namespace System;
+using namespace System::Runtime::InteropServices;
+
+// ---------------------------------------------------------------------------
+// 原生实现：读取 B-rep 文件（STEP/IGES/BREP）→ 三角化 → 平铺顶点/三角形索引。
+// 必须编译为非托管函数：OCCT 8.0 部分类型（如 BRep_Builder，经 DEFINE_STANDARD_ALLOC）
+// 含对齐成员，/clr 托管代码不支持（报 C2711/C3821/C3645）。
+// 返回：0=成功；1=不支持的扩展名；负=失败（error 带出原因）。
+// ---------------------------------------------------------------------------
+#pragma managed(push, off)
+
+// Resolve the main executable's directory for the timing log. Declared locally
+// instead of including <windows.h>: its min/max macros collide with OCCT headers,
+// and only this one API is needed. NULL gets the process EXE even from a DLL.
+extern "C" __declspec(dllimport) unsigned long __stdcall GetModuleFileNameA(
+    void* hModule, char* lpFilename, unsigned long nSize);
+
+// Minimal Win32 threading for the opt-in part-level parallel mesh pass.
+// No <windows.h>: its min/max macros collide with OCCT headers. No <thread>/
+// <mutex>/<condition_variable> either: MSVC STL disables them under /clr,
+// which also rules out OSD_Parallel (it includes Standard_Condition.hxx).
+extern "C" __declspec(dllimport) void* __stdcall CreateThread(
+    void*, unsigned long, unsigned long (__stdcall *)(void*), void*, unsigned long, unsigned long*);
+extern "C" __declspec(dllimport) unsigned long __stdcall WaitForSingleObject(void*, unsigned long);
+extern "C" __declspec(dllimport) int __stdcall CloseHandle(void*);
+
+// 单调毫秒计时（steady_clock，不受系统时间调整影响），用于"耗时预算"自适应
+static long long NowMs()
+{
+    using namespace std::chrono;
+    return (long long)duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+// 统计已网格化的三角形总数（自适应 deflection 用）
+static int CountTriangles(const TopoDS_Shape& shape)
+{
+    int total = 0;
+    for (TopExp_Explorer exp(shape, TopAbs_FACE); exp.More(); exp.Next())
+    {
+        const TopoDS_Face& face = TopoDS::Face(exp.Current());
+        TopLoc_Location loc = exp.Current().Location();
+        Handle(Poly_Triangulation) tri = BRep_Tool::Triangulation(face, loc);
+        if (!tri.IsNull()) total += tri->NbTriangles();
+    }
+    return total;
+}
+
+// 统计拓扑面数（B-rep 精确面，瞬时完成；用于 mesh 前预估网格规模）
+static int CountTopoFaces(const TopoDS_Shape& shape)
+{
+    int n = 0;
+    for (TopExp_Explorer exp(shape, TopAbs_FACE); exp.More(); exp.Next()) n++;
+    return n;
+}
+
+// 收集一个子形状（实体/外壳/整体）内所有面的三角网格；pFaceGroup 非空时逐三角形记录组号
+static void CollectFaces(const TopoDS_Shape& shapePart,
+                         std::vector<float>& pos, std::vector<int>& idx,
+                         std::vector<int>* pFaceGroup, int groupIdx)
+{
+    for (TopExp_Explorer ef(shapePart, TopAbs_FACE); ef.More(); ef.Next())
+    {
+        const TopoDS_Face& face = TopoDS::Face(ef.Current());
+        TopLoc_Location loc = ef.Current().Location();
+        Handle(Poly_Triangulation) tri = BRep_Tool::Triangulation(face, loc);
+        if (tri.IsNull()) continue;
+        gp_Trsf trsf = loc.Transformation();
+
+        int nodeStart = (int)(pos.size() / 3);
+        for (int i = 1; i <= tri->NbNodes(); i++)
+        {
+            gp_Pnt p = tri->Node(i).Transformed(trsf);
+            pos.push_back((float)p.X());
+            pos.push_back((float)p.Y());
+            pos.push_back((float)p.Z());
+        }
+        // OCCT 8.0：三角形经 Triangle(i)（1 基）逐个访问（Poly_Array1OfTriangle 已并入 NCollection_Array1<Poly_Triangle>）
+        int nbTris = tri->NbTriangles();
+        bool reversed = (face.Orientation() == TopAbs_REVERSED);
+        for (int i = 1; i <= nbTris; i++)
+        {
+            int n1, n2, n3;
+            tri->Triangle(i).Get(n1, n2, n3);
+            if (reversed) { int t = n2; n2 = n3; n3 = t; }
+            idx.push_back(nodeStart + n1 - 1);
+            idx.push_back(nodeStart + n2 - 1);
+            idx.push_back(nodeStart + n3 - 1);
+            if (pFaceGroup) pFaceGroup->push_back(groupIdx);
+        }
+    }
+}
+
+// Are the two faces really ONE smooth surface that the CAD kernel happened to split?
+//
+// BRep_Tool::Continuity() answers this when the STEP file stores continuity, and many do
+// not - they default to C0 for every edge, so the continuity test removes nothing. The
+// geometry always has the answer, though: sample both surfaces' normals at the middle of
+// the edge and compare. A split down a machined groove, a striped profile or a cylinder
+// cut into strips has two normals within a couple of degrees of each other; a real edge
+// (plate meeting plate, hole rim, chamfer) does not.
+//
+// Those splits are the main source of the dense vertical hatching the user reported: they
+// carry no shape information, so they are dropped.
+static bool FaceNormalAt(const TopoDS_Face& f, const gp_Pnt& p, gp_Dir& n)
+{
+    Handle(Geom_Surface) s = BRep_Tool::Surface(f);
+    if (s.IsNull()) return false;
+    ShapeAnalysis_Surface sas(s);
+    const gp_Pnt2d uv = sas.ValueOfUV(p, 1e-6);
+    GeomLProp_SLProps props(s, uv.X(), uv.Y(), 1, 1e-6);
+    if (!props.IsNormalDefined()) return false;
+    n = props.Normal();
+    if (f.Orientation() == TopAbs_REVERSED) n.Reverse();
+    return true;
+}
+
+static bool IsSmoothJoin(const TopoDS_Edge& edge, const TopoDS_Face& f1, const TopoDS_Face& f2)
+{
+    try
+    {
+        BRepAdaptor_Curve ac(edge);
+        const double t = 0.5 * (ac.FirstParameter() + ac.LastParameter());
+        const gp_Pnt pm = ac.Value(t);
+
+        gp_Dir n1, n2;
+        if (!FaceNormalAt(f1, pm, n1)) return false;
+        if (!FaceNormalAt(f2, pm, n2)) return false;
+        return n1.Angle(n2) < 0.35;   // ~20 degrees
+    }
+    catch (Standard_Failure&)
+    {
+        return false;   // cannot tell -> keep the edge
+    }
+}
+
+// Collect the real B-rep edges (TopoDS_Edge) as line segments.
+//
+// Why this exists: the viewer used to derive "part boundaries" from the triangle mesh, on
+// the theory that an edge used by only ONE triangle must be a border. That is false for
+// OCCT output - every face is triangulated with its own copy of the vertices, so a quad
+// patch's DIAGONAL is also used by exactly one triangle. The translucent view therefore
+// filled up with a diagonal lattice that had nothing to do with part outlines. The
+// topology knows the real edges, so they are taken from there instead.
+//
+// pEdgeGroup (optional) records the part each segment belongs to, so the viewer can hide
+// a part's outlines together with its faces. An edge shared by two parts is emitted once
+// PER part (same pixels twice): that is what "visible while either side is visible" means.
+//
+// Files with no topology (STL/OBJ) simply produce no lines.
+static void CollectEdges(const TopoDS_Shape& shape, std::vector<float>& lines,
+                         std::vector<int>* pEdgeGroup, int groupIdx,
+                         const double deflection, const double minEdgeLen)
+{
+    TopTools_IndexedDataMapOfShapeListOfShape e2f;
+    TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, e2f);
+
+    for (int i = 1; i <= e2f.Extent(); i++)
+    {
+        const TopoDS_Edge& edge = TopoDS::Edge(e2f.FindKey(i));
+        if (BRep_Tool::Degenerated(edge)) continue;
+        if (!BRep_Tool::IsGeometric(edge)) continue;
+
+        // A seam is the UV border of a closed surface (cylinder/sphere) and has the SAME
+        // face on both sides. Drawing it would put a stray line straight across a smooth
+        // surface, which is exactly the kind of clutter we are trying to remove.
+        const TopTools_ListOfShape& faces = e2f.FindFromIndex(i);
+        if (faces.Extent() == 1)
+        {
+            const TopoDS_Face& f = TopoDS::Face(faces.First());
+            if (BRep_Tool::IsClosed(edge, f)) continue;
+        }
+        // Tangent (G1/C1) transitions are NOT edges to the eye: a fillet blending into a
+        // plate, or two faces of the same cylinder, would otherwise draw a line across a
+        // surface that looks perfectly smooth. Kept edges are the C0 ones - real creases.
+        // Files that carry no continuity information report C0 by default, so this only
+        // ever removes lines that would be wrong to show.
+        if (faces.Extent() == 2)
+        {
+            const TopoDS_Face& f1 = TopoDS::Face(faces.First());
+            const TopoDS_Face& f2 = TopoDS::Face(faces.Last());
+            if (BRep_Tool::Continuity(edge, f1, f2) != GeomAbs_C0) continue;
+            if (IsSmoothJoin(edge, f1, f2)) continue;
+        }
+
+        try
+        {
+            BRepAdaptor_Curve curve(edge);
+
+            // Drop tiny edges wholesale: on a whole-machine view a 2 mm chamfer edge is a
+            // couple of pixels of pure noise, yet there are tens of thousands of them.
+            const double len = curve.LastParameter() - curve.FirstParameter();
+            gp_Pnt pFirst = curve.Value(curve.FirstParameter());
+            gp_Pnt pLast = curve.Value(curve.LastParameter());
+            if (pFirst.Distance(pLast) < minEdgeLen && len > 0.0) continue;
+
+            GCPnts_QuasiUniformDeflection tess(curve, deflection);
+            if (!tess.IsDone()) continue;
+
+            // Two surface normals for the silhouette test in the viewer. With both sides
+            // known, an edge whose two faces point opposite ways relative to the eye is an
+            // OUTLINE of the part; an edge whose faces both face the eye is interior detail
+            // (the mouth of a groove, a rib, a step). That is what lets the viewer draw a
+            // clean silhouette instead of every crease at once.
+            gp_Dir nA(0.0, 0.0, 1.0), nB(0.0, 0.0, 1.0);
+            {
+                const gp_Pnt pm = curve.Value(0.5 * (curve.FirstParameter() + curve.LastParameter()));
+                if (faces.Extent() == 2)
+                {
+                    if (!FaceNormalAt(TopoDS::Face(faces.First()), pm, nA)) nA.SetCoord(0.0, 0.0, 1.0);
+                    if (!FaceNormalAt(TopoDS::Face(faces.Last()), pm, nB)) nB = nA;
+                }
+                else
+                {
+                    nB = nA;   // open edge: both sides equal -> never a silhouette
+                }
+            }
+
+            const int n = tess.NbPoints();
+            for (int k = 1; k < n; k++)
+            {
+                const gp_Pnt a = tess.Value(k);
+                const gp_Pnt b = tess.Value(k + 1);
+                if (a.Distance(b) <= 0.0) continue;
+                lines.push_back((float)a.X());
+                lines.push_back((float)a.Y());
+                lines.push_back((float)a.Z());
+                lines.push_back((float)b.X());
+                lines.push_back((float)b.Y());
+                lines.push_back((float)b.Z());
+                lines.push_back((float)nA.X());
+                lines.push_back((float)nA.Y());
+                lines.push_back((float)nA.Z());
+                lines.push_back((float)nB.X());
+                lines.push_back((float)nB.Y());
+                lines.push_back((float)nB.Z());
+                if (pEdgeGroup) pEdgeGroup->push_back(groupIdx);
+            }
+        }
+        catch (Standard_Failure&)
+        {
+            continue;   // one bad edge must not lose the whole model
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Adaptive tessellation (same 3-stage budget logic as the flat reader). Extracted
+// so both the flat path and the XCAF path mesh a shape the same way.
+// ---------------------------------------------------------------------------
+// budgetTris / budgetMs are PER SHAPE. The XCAF path divides a global budget by the number
+// of assembly nodes: with the old per-shape defaults (800k tris / 3 s) a 1513-part model
+// meshed every part as if it were the only one, which produced 37.9 M triangles and a
+// 162 s freeze. Defaults keep the flat (single shape) path behaving exactly as before.
+static void MeshAdaptive(TopoDS_Shape& shape, int budgetTris = 800000, long long budgetMs = 3000,
+                         bool allowInternalParallel = true)
+{
+    const double kAngleBase     = 0.15;
+    const double kAngleFine     = 0.12;
+    // 0.5 rad (28.6 deg) is far too coarse: OCCT keeps a surface as a single flat facet
+    // until its normal swings by that much, so every fillet / cylindrical boss collapses
+    // into a faceted plate. 0.35 rad (20 deg) is the coarsest that still reads as a curve.
+    const double kAngleCoarse   = 0.35;
+    // A topology face that ends up with 1-2 triangles IS the "part looks bent / shifted"
+    // bug: measured on assemble.stp, part JX150ZK-6401111 had 1990 faces but only 3333
+    // triangles (1.7 per face) with a single triangle spanning 847 mm across a 1035x1114
+    // plate, so its top surface was rendered as one huge skewed facet. Give every face a
+    // floor of a few triangles before any budget-driven coarsening is allowed.
+    const int    kMinTriPerFace  = 6;
+    const int    kMaxShapeTris   = 250000;   // hard cap: one pathological part must not eat the frame
+    const long long kMeshBudgetMs = budgetMs;
+
+    Bnd_Box box;
+    BRepBndLib::Add(shape, box);
+    double xmin = 0, ymin = 0, zmin = 0, xmax = 0, ymax = 0, zmax = 0;
+    box.Get(xmin, ymin, zmin, xmax, ymax, zmax);
+    double diag = box.IsVoid() ? 1.0 : ((xmax - xmin) + (ymax - ymin) + (zmax - zmin)) / 3.0;
+    if (diag <= 0) diag = 1.0;
+    double deflection = diag * 0.002;
+    double angle = kAngleBase;
+
+    int nTopo = CountTopoFaces(shape);
+
+    // Quality CEILING on coarseness - the hard rule that keeps the "part looks bent" bug
+    // from ever coming back. It is derived from the part's own feature size: diag /
+    // sqrt(faceCount) is the typical span of one B-rep face, so a part made of many small
+    // faces (sheet metal, castings) can never be flattened just because it also happens to
+    // have a large bounding box, while a part with a handful of big faces may still coarsen
+    // a lot (it does not need the triangles anyway).
+    // Previously both the pre-pass and the budget loop capped the chord error at
+    // diag*0.01 / diag*0.02 = 11-15 mm on a 1 m plate, which is exactly how the top surface
+    // of JX150ZK-6401111 (1990 faces, 3333 triangles, one 847 mm edge) turned into one
+    // skewed facet.
+    double faceSpan = diag / std::sqrt((double)(nTopo > 0 ? nTopo : 1));
+    double deflCeil = faceSpan * 0.15;
+    if (deflCeil < diag * 0.002) deflCeil = diag * 0.002;   // never coarser than the base mesh
+    if (deflCeil > diag * 0.02)  deflCeil = diag * 0.02;   // and never beyond the historic cap
+
+    // Per-shape triangle budget: never below what the face count needs (kMinTriPerFace
+    // each), never above the hard cap. Downstream comparisons use `budget`, not the
+    // caller's share, so a many-faced part stops being coarsened by an arbitrary
+    // "global budget / node count" split.
+    long long budget = (long long)budgetTris;
+    long long needByFaces = (long long)nTopo * (long long)kMinTriPerFace;
+    if (needByFaces > budget) budget = needByFaces;
+    if (budget > (long long)kMaxShapeTris) budget = (long long)kMaxShapeTris;
+
+    // Estimated triangles for this shape. The old factor of 100 over-estimated by a
+    // factor of ~50 (measured: 5-15 triangles per B-rep face), which pushed the
+    // deflection up severalfold on any part with more than ~60 faces.
+    double nEst = (double)nTopo * 8.0;
+    if (nEst > (double)budget)
+    {
+        double s = std::sqrt(nEst / (double)budget) * 1.1;
+        if (s > 3.0) s = 3.0;                       // bounded: never blow the deflection up
+        deflection *= s;
+        if (deflection > deflCeil) deflection = deflCeil;
+        angle = std::min(kAngleCoarse, angle * std::sqrt(s));
+    }
+
+    long long t0 = NowMs();
+    BRepMesh_IncrementalMesh mesher(shape, deflection, false, angle, allowInternalParallel);
+    long long meshMs = NowMs() - t0;
+    int prev = CountTriangles(shape);
+
+    for (int iter = 0; iter < 3 && ((long long)prev > budget || meshMs > kMeshBudgetMs); iter++)
+    {
+        double sFace = ((long long)prev > budget) ? std::sqrt((double)prev / (double)budget) * 1.25 : 1.0;
+        double sTime = (meshMs > kMeshBudgetMs) ? (double)meshMs / (double)kMeshBudgetMs : 1.0;
+        double s = (sFace > sTime) ? sFace : sTime;
+        if (s <= 1.0) break;
+        if (s > 4.0) s = 4.0;
+        // Normal case: coarsening is bounded by the quality ceiling. Last resort only when
+        // a single part already blows the hard triangle cap (a knurled/threaded shape with
+        // thousands of tiny faces) - then visual smoothness yields to "the frame must not
+        // die", and we fall back to the historic ceiling.
+        double cap = ((long long)prev > (long long)kMaxShapeTris) ? (diag * 0.02) : deflCeil;
+        double newDefl = deflection * s;
+        if (newDefl > cap) newDefl = cap;
+        double newAngle = std::min(kAngleCoarse, angle * std::sqrt(s));
+        // Both knobs are already pinned at their coarsest allowed value: re-meshing would
+        // reproduce the same triangulation, and the loop would burn 3 full tessellations of
+        // a heavy part for nothing (this is the "budget exceeded, quality floor reached"
+        // endgame - accept the triangle count instead).
+        if (newDefl <= deflection && newAngle <= angle) break;
+        deflection = newDefl;
+        angle = newAngle;
+        BRepTools::Clean(shape);
+        long long m0 = NowMs();
+        BRepMesh_IncrementalMesh mesherN(shape, deflection, false, angle, allowInternalParallel);
+        long long mMs = NowMs() - m0;
+        int cur = CountTriangles(shape);
+        if (cur > prev * 8 / 10 && mMs <= kMeshBudgetMs) { prev = cur; meshMs = mMs; break; }
+        prev = cur;
+        meshMs = mMs;
+    }
+
+    if ((long long)prev * 2 < budget && meshMs * 3 < kMeshBudgetMs)
+    {
+        BRepTools::Clean(shape);
+        BRepMesh_IncrementalMesh mesherF(shape, deflection, false, kAngleFine, allowInternalParallel);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// XCAF tree extraction: real part names + assembly hierarchy from STEP/IGES.
+// ---------------------------------------------------------------------------
+// UTF-16 (char16_t, exactly what TCollection_ExtendedString::ToExtString() returns)
+// -> UTF-8, decoded here on purpose. TCollection_ExtendedString::ToUTF8CString() hands
+// back a buffer that is NOT owned by Standard::Allocate, so releasing it with
+// Standard::Free corrupts the heap: it surfaced as an access violation inside the
+// assembly-tree walk, which made the whole XCAF path fail and silently fall back to the
+// flat reader (no real names, no hierarchy). Converting here allocates nothing.
+static std::string Utf16ToUtf8(const char16_t* src, int len)
+{
+    std::string out;
+    if (src == 0 || len <= 0) return out;
+    out.reserve((size_t)len * 3 + 1);
+    for (int i = 0; i < len; i++)
+    {
+        unsigned int u = (unsigned int)src[i];
+        if (u >= 0xD800u && u <= 0xDBFFu && i + 1 < len)
+        {
+            unsigned int lo = (unsigned int)src[i + 1];
+            if (lo >= 0xDC00u && lo <= 0xDFFFu)
+            {
+                u = 0x10000u + ((u - 0xD800u) << 10) + (lo - 0xDC00u);
+                i++;
+            }
+            else u = 0xFFFDu;
+        }
+        else if (u >= 0xD800u && u <= 0xDFFFu) u = 0xFFFDu;
+
+        if (u < 0x80u)
+        {
+            out += (char)u;
+        }
+        else if (u < 0x800u)
+        {
+            out += (char)(0xC0u | (u >> 6));
+            out += (char)(0x80u | (u & 0x3Fu));
+        }
+        else if (u < 0x10000u)
+        {
+            out += (char)(0xE0u | (u >> 12));
+            out += (char)(0x80u | ((u >> 6) & 0x3Fu));
+            out += (char)(0x80u | (u & 0x3Fu));
+        }
+        else
+        {
+            out += (char)(0xF0u | (u >> 18));
+            out += (char)(0x80u | ((u >> 12) & 0x3Fu));
+            out += (char)(0x80u | ((u >> 6) & 0x3Fu));
+            out += (char)(0x80u | (u & 0x3Fu));
+        }
+    }
+    return out;
+}
+
+static std::string XcafLabelName(const TDF_Label& L)
+{
+    Handle(TDataStd_Name) nm;
+    if (L.FindAttribute(TDataStd_Name::GetID(), nm) && !nm.IsNull())
+    {
+        TCollection_ExtendedString ext = nm->Get();
+        return Utf16ToUtf8(ext.ToExtString(), ext.Length());
+    }
+    return std::string();
+}
+
+// Tessellation cache for the assembly walk. An assembly typically instantiates the same
+// part many times (screws, plates, cloth panels...). Meshing every instance separately
+// turned a 22 MB file into 37.7 M triangles and a 162 s freeze; with this cache each
+// DISTINCT shape is meshed once and the copies only get their vertices transformed.
+struct XcafMeshCache
+{
+    std::vector<float> pos;
+    std::vector<int>   idx;
+    std::vector<float> ed;      // 12 floats per outline segment: a, b, normalA, normalB
+    bool valid = false;
+    bool queued = false;   // parallel path: a mesh task has already been recorded
+};
+
+// ---- Optional part-level parallel tessellation --------------------------------
+// XcafDfs records one MeshTask per DISTINCT shape and one AppendTask per instance.
+// MeshTasks run on OCCT's OSD_ThreadPool; AppendTasks are replayed in DFS order
+// afterwards, so faceGroups / part indices stay identical to the serial path.
+struct XcafMeshTask
+{
+    TopoDS_Shape shape;
+    int          slot;     // 1-based index into XcafCtx::pMeshCache
+    int          perTri;
+    long long    perMs;
+};
+
+struct XcafAppendTask
+{
+    int     slot;
+    gp_Trsf trsf;
+    int     node;
+};
+
+// Worker for the opt-in parallel mesh pass. Static interleaved partitioning
+// (worker t handles t, t+stride, ...) needs no atomics and evens out the very
+// different per-shape costs (B_SPLINE faces vs planar faces) reasonably well.
+struct XcafWorkerArgs
+{
+    std::vector<XcafMeshTask>*  tasks;
+    std::vector<XcafMeshCache>* cache;
+    std::vector<float>*         pEdgeLines;
+    double                      deflEdge;
+    double                      minLen;
+    int                         first;
+    int                         stride;
+};
+
+static unsigned long __stdcall XcafMeshWorker(void* raw)
+{
+    XcafWorkerArgs* a = (XcafWorkerArgs*)raw;
+    const int n = (int)a->tasks->size();
+    for (int i = a->first; i < n; i += a->stride)
+    {
+        XcafMeshTask&  mt = (*a->tasks)[(size_t)i];
+        XcafMeshCache& mc = (*a->cache)[(size_t)(mt.slot - 1)];
+        try
+        {
+            // Internal face-level parallelism is OFF here: part-level is the
+            // outer parallel layer, nesting both oversubscribes a 44-core box.
+            MeshAdaptive(mt.shape, mt.perTri, mt.perMs, false);
+            std::vector<int> dummyFg, dummyEg;
+            CollectFaces(mt.shape, mc.pos, mc.idx, &dummyFg, 0);
+            if (a->pEdgeLines)
+                CollectEdges(mt.shape, mc.ed, &dummyEg, 0, a->deflEdge, a->minLen);
+            mc.valid = true;
+        }
+        catch (Standard_Failure&) { mc.valid = false; }
+        catch (...)               { mc.valid = false; }
+    }
+    return 0;
+}
+
+static void ResolveMeshTasks(std::vector<XcafMeshTask>& tasks,
+                             std::vector<XcafMeshCache>& cache,
+                             std::vector<float>* pEdgeLines,
+                             double deflEdge, double minLen, int nThreads)
+{
+    const int n = (int)tasks.size();
+    if (n <= 0) return;
+    if (nThreads > n) nThreads = n;
+    if (nThreads < 1) nThreads = 1;
+
+    std::vector<XcafWorkerArgs> args((size_t)nThreads);
+    std::vector<void*> handles((size_t)nThreads, 0);
+    for (int t = 0; t < nThreads; ++t)
+    {
+        XcafWorkerArgs& a = args[(size_t)t];
+        a.tasks = &tasks; a.cache = &cache; a.pEdgeLines = pEdgeLines;
+        a.deflEdge = deflEdge; a.minLen = minLen;
+        a.first = t; a.stride = nThreads;
+    }
+    if (nThreads == 1)
+    {
+        XcafMeshWorker(&args[0]);
+        return;
+    }
+
+    int started = 0;
+    for (int t = 0; t < nThreads; ++t)
+    {
+        unsigned long tid = 0;
+        void* h = CreateThread(0, 0, &XcafMeshWorker, &args[(size_t)t], 0, &tid);
+        if (h == 0) break;                 // remaining ranges are done by the caller
+        handles[(size_t)t] = h;
+        started++;
+    }
+    for (int t = started; t < nThreads; ++t)
+        XcafMeshWorker(&args[(size_t)t]);
+    for (int t = 0; t < started; ++t)
+    {
+        WaitForSingleObject(handles[(size_t)t], 0xFFFFFFFFu);   // INFINITE
+        CloseHandle(handles[(size_t)t]);
+    }
+}
+
+static void AppendCachedMesh(const XcafMeshCache& mc, const gp_Trsf& t,
+    std::vector<float>& pos, std::vector<int>& idx,
+    std::vector<int>* pFaceGroup, int groupIdx,
+    std::vector<float>* pEdgeLines, std::vector<int>* pEdgeGroups)
+{
+    const int base = (int)(pos.size() / 3);
+    for (size_t i = 0; i + 2 < mc.pos.size(); i += 3)
+    {
+        gp_Pnt p(mc.pos[i], mc.pos[i + 1], mc.pos[i + 2]);
+        p.Transform(t);
+        pos.push_back((float)p.X());
+        pos.push_back((float)p.Y());
+        pos.push_back((float)p.Z());
+    }
+    const size_t ntri = mc.idx.size() / 3;
+    for (size_t i = 0; i < mc.idx.size(); i++)
+        idx.push_back(mc.idx[i] + base);
+    if (pFaceGroup)
+        pFaceGroup->insert(pFaceGroup->end(), ntri, groupIdx);
+
+    if (pEdgeLines && !mc.ed.empty())
+    {
+        for (size_t i = 0; i + 11 < mc.ed.size(); i += 12)
+        {
+            gp_Pnt a(mc.ed[i], mc.ed[i + 1], mc.ed[i + 2]);
+            gp_Pnt b(mc.ed[i + 3], mc.ed[i + 4], mc.ed[i + 5]);
+            gp_Vec na(mc.ed[i + 6], mc.ed[i + 7], mc.ed[i + 8]);
+            gp_Vec nb(mc.ed[i + 9], mc.ed[i + 10], mc.ed[i + 11]);
+            a.Transform(t); b.Transform(t);
+            na.Transform(t); nb.Transform(t);
+            pEdgeLines->push_back((float)a.X());
+            pEdgeLines->push_back((float)a.Y());
+            pEdgeLines->push_back((float)a.Z());
+            pEdgeLines->push_back((float)b.X());
+            pEdgeLines->push_back((float)b.Y());
+            pEdgeLines->push_back((float)b.Z());
+            pEdgeLines->push_back((float)na.X());
+            pEdgeLines->push_back((float)na.Y());
+            pEdgeLines->push_back((float)na.Z());
+            pEdgeLines->push_back((float)nb.X());
+            pEdgeLines->push_back((float)nb.Y());
+            pEdgeLines->push_back((float)nb.Z());
+            if (pEdgeGroups) pEdgeGroups->push_back(groupIdx);
+        }
+    }
+}
+
+struct XcafCtx
+{
+    Handle(XCAFDoc_ShapeTool) shapeTool;
+    std::vector<float>* pos;
+    std::vector<int>* idx;
+    std::vector<int>* pFaceGroup;
+    std::vector<float>* pEdgeLines;
+    std::vector<int>* pEdgeGroups;
+    std::vector<std::string>* partNames;
+    std::vector<int>* partParents;
+    std::vector<char>* partHasGeo;
+    double deflEdge;
+    double minLen;
+    bool failed;          // set by XcafDfs when a node blows up
+    std::string err;      // which step failed
+    TopTools_IndexedMapOfShape* pShapeMap;    // referred shape -> cache slot (1-based)
+    std::vector<XcafMeshCache>* pMeshCache;   // parallel to pShapeMap
+    int perShapeTris;                         // per-shape triangle budget (global / node count)
+    long long perShapeMs;                     // per-shape meshing time budget
+    long long meshMs;                         // accumulated tessellation time (diagnostics)
+    long long collectMs;                      // accumulated vertex/index copy time (diagnostics)
+    // Face-weighted budget: a split by node count gives a 1035x1114 mm sheet-metal part
+    // the same share as a 21x43x31 bracket, which is how one big part ends up with 1.7
+    // triangles per face. Weighing by topology face count instead gives the big part the
+    // triangles it actually needs while the small ones keep using almost nothing.
+    long long triBudgetTotal;
+    long long msBudgetTotal;
+    long long totalTopoFaces;                 // unique (de-duplicated) faces across the assembly
+    // Parallel path (off unless CAD_MESH_PARALLEL=1): XcafDfs records tasks
+    // instead of meshing / appending inline.
+    bool deferMesh = false;
+    std::vector<XcafMeshTask>*   pMeshTasks = nullptr;
+    std::vector<XcafAppendTask>* pAppendTasks = nullptr;
+};
+
+// Cheap pre-pass: count assembly nodes WITHOUT meshing anything. Used to split a global
+// triangle/time budget across the parts before the real (expensive) walk starts.
+static int XcafCountNodes(const TDF_Label& inst, const Handle(XCAFDoc_ShapeTool)& st)
+{
+    int n = 1;
+    TDF_Label geo = inst;
+    if (st->IsComponent(inst))
+    {
+        TDF_Label ref;
+        if (st->GetReferredShape(inst, ref)) geo = ref;
+    }
+    if (st->IsAssembly(geo))
+    {
+        NCollection_Sequence<TDF_Label> comps;
+        st->GetComponents(geo, comps);
+        for (int ci = 1; ci <= comps.Length(); ci++)
+            n += XcafCountNodes(comps.Value(ci), st);
+    }
+    return n;
+}
+
+// Total topology faces of every DISTINCT shape in the assembly, used to weight the
+// tessellation budget by how much surface each part actually has. De-duplicated with the
+// same identity the mesh cache uses (location stripped), so a screw instanced 500 times
+// is counted once - its cost is one mesh, not 500.
+static long long XcafCountTopoFacesUnique(const TDF_Label& inst, const Handle(XCAFDoc_ShapeTool)& st,
+                                          TopTools_IndexedMapOfShape& seen)
+{
+    TDF_Label geo = inst;
+    if (st->IsComponent(inst))
+    {
+        TDF_Label ref;
+        if (st->GetReferredShape(inst, ref)) geo = ref;
+    }
+    if (st->IsAssembly(geo))
+    {
+        NCollection_Sequence<TDF_Label> comps;
+        st->GetComponents(geo, comps);
+        long long n = 0;
+        for (int ci = 1; ci <= comps.Length(); ci++)
+            n += XcafCountTopoFacesUnique(comps.Value(ci), st, seen);
+        return n;
+    }
+    if (!st->IsSimpleShape(geo)) return 0;
+    TopoDS_Shape s;
+    if (!st->GetShape(geo, s) || s.IsNull()) return 0;
+    const int before = seen.Extent();
+    seen.Add(s.Located(TopLoc_Location()));
+    if (seen.Extent() == before) return 0;        // already counted through another instance
+    return (long long)CountTopoFaces(s.Located(TopLoc_Location()));
+}
+
+// A name the UI cannot meaningfully show: empty, OCCT's raw label entry "=>[..]", or
+// the exporter's placeholder names "?", "?1", "?2" (SolidWorks writes these for unnamed
+// component instances - the original characters were already lost at export time).
+// NOTE: do NOT test `s == "?"` only; real files carry "?1", "?2", "? 3", etc.
+static bool IsBadPartName(const std::string& s)
+{
+    if (s.empty()) return true;
+    if (s.size() >= 3 && s.compare(0, 3, "=>[") == 0) return true;
+    bool hasQuestion = false;
+    for (size_t i = 0; i < s.size(); i++)
+    {
+        char c = s[i];
+        if (c == '?') { hasQuestion = true; continue; }
+        if ((c >= '0' && c <= '9') || c == ' ' || c == '\t' || c == '_' || c == '-' || c == '.') continue;
+        return false;   // contains real letters/CJK: a usable name
+    }
+    return hasQuestion; // "?" / "?1" / "? 2" -> bad; empty already handled above
+}
+
+static void XcafDfs(const TDF_Label& inst, int parentNode, TopLoc_Location loc, XcafCtx& ctx)
+{
+    if (ctx.failed) return;
+    const char* st = "enter";
+    try
+    {
+        TDF_Label geo = inst;
+        TopLoc_Location nodeLoc = loc;
+        st = "IsComponent";
+        bool isComp = ctx.shapeTool->IsComponent(inst);
+        if (isComp)
+        {
+            TDF_Label ref;
+            st = "GetReferredShape";
+            if (ctx.shapeTool->GetReferredShape(inst, ref))
+            {
+                geo = ref;
+                st = "GetLocation";
+                nodeLoc = loc * ctx.shapeTool->GetLocation(inst);
+            }
+        }
+        int myNode = (int)ctx.partNames->size();
+        st = "LabelName";
+        // Prefer the instance/own name (many exporters put the meaningful name there, e.g.
+        // "VIGA-1-SUP" on a MESA assembly). Only when it is unusable - empty, OCCT's raw
+        // "=>[..]" label entry, or the exporter's "?1"/"?2" placeholders - fall back to the
+        // referred PRODUCT name (which is where the real Chinese text lives), then to "Part N".
+        std::string nm = XcafLabelName(inst);
+        if (IsBadPartName(nm)) nm = XcafLabelName(geo);
+        if (IsBadPartName(nm)) nm = "Part " + std::to_string(myNode + 1);
+        ctx.partNames->push_back(nm);
+        ctx.partParents->push_back(parentNode);
+        ctx.partHasGeo->push_back(0);
+        st = "IsAssembly";
+        if (ctx.shapeTool->IsAssembly(geo))
+        {
+            NCollection_Sequence<TDF_Label> comps;
+            st = "GetComponents";
+            ctx.shapeTool->GetComponents(geo, comps);
+            for (int ci = 1; ci <= comps.Length(); ci++)
+            {
+                XcafDfs(comps.Value(ci), myNode, nodeLoc, ctx);
+                if (ctx.failed) return;
+            }
+        }
+        else
+        {
+            st = "IsSimpleShape";
+            if (ctx.shapeTool->IsSimpleShape(geo))
+            {
+                TopoDS_Shape s;
+                st = "GetShape";
+                if (ctx.shapeTool->GetShape(geo, s) && !s.IsNull())
+                {
+                    TopLoc_Location L = nodeLoc * s.Location();
+                    // The cache must hold geometry with NO location of its own:
+                    // CollectFaces() only picks up each face's location RELATIVE to the
+                    // shape, so a shape carrying s.Location() would bake that location in.
+                    // TopTools_IndexedMapOfShape compares shapes while IGNORING location,
+                    // so two PRODUCTs sharing one TShape but living at different places
+                    // would collapse onto the first instance's coordinates - parts end up
+                    // rotated or off their mating surface. Stripping the location makes the
+                    // cached vertices pure local geometry, and every instance then applies
+                    // the full chain L = nodeLoc * s.Location().
+                    TopoDS_Shape sLocal = s.Located(TopLoc_Location());
+                    if (ctx.deferMesh && ctx.pMeshTasks && ctx.pAppendTasks
+                        && ctx.pShapeMap && ctx.pMeshCache)
+                    {
+                        st = "Mesh";
+                        int key = ctx.pShapeMap->Add(sLocal);
+                        if (key > 0)
+                        {
+                            if ((int)ctx.pMeshCache->size() < key)
+                                ctx.pMeshCache->resize(key);
+                            XcafMeshCache& mc = (*ctx.pMeshCache)[key - 1];
+                            if (!mc.valid && !mc.queued)
+                            {
+                                int perTri = ctx.perShapeTris;
+                                long long perMs = ctx.perShapeMs;
+                                int nT = CountTopoFaces(sLocal);
+                                if (ctx.totalTopoFaces > 0 && nT > 0)
+                                {
+                                    long long share = ctx.triBudgetTotal * (long long)nT / ctx.totalTopoFaces;
+                                    if (share < 3000) share = 3000;
+                                    if (share > 400000) share = 400000;
+                                    perTri = (int)share;
+                                    long long shareMs = ctx.msBudgetTotal * (long long)nT / ctx.totalTopoFaces;
+                                    if (shareMs < 80) shareMs = 80;
+                                    if (shareMs > 8000) shareMs = 8000;
+                                    perMs = shareMs;
+                                }
+                                XcafMeshTask mt;
+                                mt.shape = sLocal;
+                                mt.slot = key;
+                                mt.perTri = perTri;
+                                mt.perMs = perMs;
+                                ctx.pMeshTasks->push_back(mt);
+                                mc.queued = true;
+                            }
+                            XcafAppendTask at;
+                            at.slot = key;
+                            at.trsf = L.Transformation();
+                            at.node = myNode;
+                            ctx.pAppendTasks->push_back(at);
+                        }
+                    }
+                    else
+                    {
+                        st = "Mesh";
+                        // Mesh each DISTINCT shape once; every further instance of it only gets
+                        // its cached vertices transformed. Without this, assemblies that reuse
+                        // one part hundreds of times explode into tens of millions of triangles.
+                        XcafMeshCache* mc = 0;
+                        if (ctx.pShapeMap && ctx.pMeshCache)
+                        {
+                            int key = ctx.pShapeMap->Add(sLocal);
+                            if (key > 0)
+                            {
+                                if ((int)ctx.pMeshCache->size() < key)
+                                    ctx.pMeshCache->resize(key);
+                                mc = &(*ctx.pMeshCache)[key - 1];
+                            }
+                        }
+                        if (mc && !mc->valid)
+                        {
+                            long long m0 = NowMs();
+                            // Weight the global tessellation budget by this shape's topology
+                            // face count (see XcafCtx::triBudgetTotal). Falls back to the flat
+                            // per-node share when the pre-pass produced nothing.
+                            int perTri = ctx.perShapeTris;
+                            long long perMs = ctx.perShapeMs;
+                            int nT = CountTopoFaces(sLocal);
+                            if (ctx.totalTopoFaces > 0 && nT > 0)
+                            {
+                                long long share = ctx.triBudgetTotal * (long long)nT / ctx.totalTopoFaces;
+                                if (share < 3000) share = 3000;          // floor: no faceted blob
+                                if (share > 400000) share = 400000;      // ceiling: one part cannot own the frame
+                                perTri = (int)share;
+                                long long shareMs = ctx.msBudgetTotal * (long long)nT / ctx.totalTopoFaces;
+                                if (shareMs < 80) shareMs = 80;
+                                if (shareMs > 8000) shareMs = 8000;
+                                perMs = shareMs;
+                            }
+                            MeshAdaptive(sLocal, perTri, perMs);
+                            std::vector<int> dummyFg, dummyEg;
+                            CollectFaces(sLocal, mc->pos, mc->idx, &dummyFg, 0);
+                            if (ctx.pEdgeLines)
+                                CollectEdges(sLocal, mc->ed, &dummyEg, 0, ctx.deflEdge, ctx.minLen);
+                            mc->valid = true;
+                            ctx.meshMs += NowMs() - m0;
+                        }
+                        st = "Collect";
+                        if (mc && mc->valid)
+                        {
+                            // The cached vertices ALREADY carry the referred shape's own
+                            // location: CollectFaces() transforms every node by the face
+                            // location, which TopExp_Explorer composes down from `s`, so
+                            // s.Location() is baked in. What is still missing is only the
+                            // accumulated INSTANCE chain, nodeLoc. Applying L (= nodeLoc *
+                            // s.Location()) here would bake s.Location() in a second time
+                            // and scatter the parts across the scene (seen as misplaced
+                            // parts on a 1513-node assembly).
+                            long long c0 = NowMs();
+                            AppendCachedMesh(*mc, L.Transformation(), *ctx.pos, *ctx.idx,
+                                             ctx.pFaceGroup, myNode, ctx.pEdgeLines, ctx.pEdgeGroups);
+                            ctx.collectMs += NowMs() - c0;
+                        }
+                        else
+                        {
+                            // No cache (should not happen): mesh this instance on its own.
+                            TopoDS_Shape sw = BRepBuilderAPI_Transform(s, L.Transformation(), Standard_True).Shape();
+                            MeshAdaptive(sw, ctx.perShapeTris, ctx.perShapeMs);
+                            CollectFaces(sw, *ctx.pos, *ctx.idx, ctx.pFaceGroup, myNode);
+                            if (ctx.pEdgeLines) CollectEdges(sw, *ctx.pEdgeLines, ctx.pEdgeGroups, myNode, ctx.deflEdge, ctx.minLen);
+                        }
+                    }
+                    ctx.partHasGeo->back() = 1;
+                }
+            }
+        }
+    }
+    catch (Standard_Failure& ex)
+    {
+        // A single broken shape (e.g. an empty placeholder instance exported by a
+        // converter - its Bnd_Box is void and Bnd_Box::Get throws) must not kill the
+        // whole assembly tree: the node stays in the tree flagged as "no geometry"
+        // (shown greyed out) and the walk continues. Only failures outside the
+        // per-shape meshing stage are fatal for the XCAF path.
+        if (st == "Mesh")
+        {
+            fprintf(stderr, "OCCT reader: skip node without geometry (Mesh failed: %s)\n",
+                    ex.what() ? ex.what() : "unknown");
+            fflush(stderr);
+            return;
+        }
+        ctx.failed = true;
+        ctx.err = std::string("XcafDfs ") + st + ": " + (ex.what() ? ex.what() : "");
+    }
+    catch (...)
+    {
+        if (st == "Mesh")
+        {
+            fprintf(stderr, "OCCT reader: skip node without geometry (Mesh failed: unknown exception)\n");
+            fflush(stderr);
+            return;
+        }
+        ctx.failed = true;
+        ctx.err = std::string("XcafDfs unknown exception at ") + st;
+    }
+}
+
+// Some files carry the wrong extension: sample.iges in the corpus is really a STEP file
+// (it starts with ISO-10303-21) and an IGES-only reader can never open it. Decide by
+// content first, then fall back to the extension. ASCII only (see the encoding note above).
+static bool FileLooksLikeStep(const char* pathUtf8)
+{
+    FILE* f = fopen(pathUtf8, "rb");
+    if (!f) return false;
+    char buf[8192];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    std::string head(buf, n);
+    return head.find("ISO-10303-21") != std::string::npos;
+}
+
+static bool IsStepFile(const char* pathUtf8, const std::string& ext)
+{
+    if (ext == ".step" || ext == ".stp") return true;
+    if (ext == ".iges" || ext == ".igs") return FileLooksLikeStep(pathUtf8);
+    return false;
+}
+
+static bool IsIgesFile(const char* pathUtf8, const std::string& ext)
+{
+    if (ext != ".iges" && ext != ".igs") return false;
+    return !FileLooksLikeStep(pathUtf8);
+}
+// Read via the XCAF stack (STEPCAFControl_Reader / IGESCAFControl_Reader). Returns 0 on
+// success (partNames/partParents/partHasGeo populated with the assembly tree); negative on
+// failure so the caller can fall back to the flat solid-grouped reader.
+static int ReadNativeXcaf(const char* pathUtf8,
+    std::vector<float>& pos, std::vector<int>& idx,
+    std::vector<int>* pFaceGroup, std::vector<float>* pEdgeLines, std::vector<int>* pEdgeGroups,
+    std::vector<std::string>& partNames, std::vector<int>& partParents, std::vector<char>& partHasGeo,
+    std::string& error)
+{
+    std::string stage = "start";
+    long long tReadFile = 0, tTransfer = 0, tDfs = 0;   // phase timings (see OCCT_PROBE below)
+    try
+    {
+        std::string path(pathUtf8);
+        size_t dot = path.find_last_of('.');
+        std::string ext = (dot == std::string::npos) ? std::string() : path.substr(dot);
+        for (size_t i = 0; i < ext.size(); i++)
+            ext[i] = (char)std::tolower((unsigned char)ext[i]);
+
+        // NOTE: XCAFApp_Application::GetApplication()->NewDocument() is the textbook way to
+        // create this document, but referencing XCAFApp_Application drags in TKVCAF and with
+        // it the whole AIS/PrsDim presentation stack (104 unresolved symbols at link time),
+        // breaking the zero-extra-dependency contract of this wrapper. XCAFDoc_DocumentTool::
+        // ShapeTool() creates the tool attribute on demand, so a plain document suffices.
+        stage = "new document";
+        Handle(TDocStd_Document) doc = new TDocStd_Document(TCollection_ExtendedString("XmlXCAF"));
+        if (doc.IsNull()) { error = "XCAF document creation failed"; return -1; }
+        if (IsStepFile(pathUtf8, ext))
+        {
+            // Some Chinese CAD exporters write part names as raw GBK bytes instead of the
+            // standard \X2\..hex..\X0\ escape. OCCT decodes non-escaped text with the
+            // "read.step.codepage" static (UTF-8 by default), which turns those names into
+            // garbage code points. GBK (a superset of GB2312) decodes them correctly, while
+            // \X2\ escapes are converted independently of this setting and stay intact either
+            // way. GBK is preferred over plain GB because any valid GB2312 byte sequence
+            // decodes identically under GBK, and GBK additionally covers the characters
+            // GB2312 omits.
+            Interface_Static::SetIVal("read.step.codepage", (int)Resource_FormatType_GBK);
+            // Trim what this wrapper never consumes. GDT / SHUO carry tolerance and
+            // semantic-PMI annotations, and "props" carries material / mass / validation
+            // data - none of it reaches the viewer, but each record still gets built into
+            // the XCAF document during Transfer (a measurable share on AP242 files that
+            // are annotation-heavy). Names, colours, layers and geometry stay untouched.
+            STEPCAFControl_Reader reader;
+            reader.SetGDTMode(false);
+            reader.SetSHUOMode(false);
+            reader.SetPropsMode(false);
+            // The viewer never consumes STEP colours, materials, layers, views or
+            // metadata: parts get the built-in 24-colour palette / glass hues, and the
+            // tree only needs names + hierarchy. OCCT still builds an XCAF attribute for
+            // every one of those records during Transfer; on large AP214/AP242 assemblies
+            // that is a measurable share of the total load time. Keep NameMode ON (part
+            // labels) and leave geometry/assembly structure untouched.
+            reader.SetColorMode(false);
+            reader.SetLayerMode(false);
+            reader.SetMatMode(false);
+            reader.SetViewMode(false);
+            reader.SetMetaMode(false);
+            reader.SetProductMetaMode(false);
+            stage = "STEP ReadFile";
+            long long tp0 = NowMs();
+            if (reader.ReadFile(pathUtf8) != IFSelect_RetDone) { error = "STEP parse failed (XCAF)"; return -1; }
+            tReadFile = NowMs() - tp0;
+            stage = "STEP Transfer";
+            tp0 = NowMs();
+            if (!reader.Transfer(doc)) { error = "STEP transfer failed (XCAF)"; return -1; }
+            tTransfer = NowMs() - tp0;
+        }
+        else if (IsIgesFile(pathUtf8, ext))
+        {
+            stage = "IGES ReadFile";
+            IGESCAFControl_Reader reader;
+            long long tp0 = NowMs();
+            if (reader.ReadFile(pathUtf8) != IFSelect_RetDone) { error = "IGES parse failed (XCAF)"; return -1; }
+            tReadFile = NowMs() - tp0;
+            stage = "IGES Transfer";
+            tp0 = NowMs();
+            if (!reader.Transfer(doc)) { error = "IGES transfer failed (XCAF)"; return -1; }
+            tTransfer = NowMs() - tp0;
+        }
+        else
+        {
+            return -1;   // BREP has no XCAF assembly tree; fall back to flat reader
+        }
+        stage = "ShapeTool";
+        Handle(XCAFDoc_ShapeTool) shapeTool = XCAFDoc_DocumentTool::ShapeTool(doc->Main());
+        if (shapeTool.IsNull()) { error = "XCAF ShapeTool is null"; return -1; }
+
+        Bnd_Box box;
+        NCollection_Sequence<TDF_Label> tops;
+        stage = "GetShapes";
+        // GetShapes() also returns referred PROTOTYPES (not just free roots); DFS-ing
+        // those again with an identity location duplicates every part and leaves an
+        // unplaced copy at its raw coordinates (bbox reached z=-2000 / x=-1673).
+        // GetFreeShapes() returns only shapes not referred by any other -> true roots.
+        shapeTool->GetFreeShapes(tops);
+        for (int ti = 1; ti <= tops.Length(); ti++)
+        {
+            TopoDS_Shape s; shapeTool->GetShape(tops.Value(ti), s);
+            if (!s.IsNull()) BRepBndLib::Add(s, box);
+        }
+        double xmin = 0, ymin = 0, zmin = 0, xmax = 0, ymax = 0, zmax = 0;
+        if (!box.IsVoid()) box.Get(xmin, ymin, zmin, xmax, ymax, zmax);
+        double maxDim = 1.0;
+        if (!box.IsVoid()) maxDim = std::max(std::max(xmax - xmin, ymax - ymin), zmax - zmin);
+        double deflEdge = maxDim * 1.5e-4; if (deflEdge < 0.05) deflEdge = 0.05;
+        double minLen = maxDim * 1.2e-3;   if (minLen < 0.3)  minLen = 0.3;
+
+        XcafCtx ctx;
+        ctx.shapeTool = shapeTool;
+        ctx.pos = &pos; ctx.idx = &idx;
+        ctx.pFaceGroup = pFaceGroup; ctx.pEdgeLines = pEdgeLines; ctx.pEdgeGroups = pEdgeGroups;
+        ctx.partNames = &partNames; ctx.partParents = &partParents; ctx.partHasGeo = &partHasGeo;
+        ctx.deflEdge = deflEdge; ctx.minLen = minLen;
+        ctx.failed = false;
+        ctx.meshMs = 0; ctx.collectMs = 0;
+        TopTools_IndexedMapOfShape shapeMap;
+        std::vector<XcafMeshCache> meshCache;
+        ctx.pShapeMap = &shapeMap;
+        ctx.pMeshCache = &meshCache;
+
+        // Part-level parallel tessellation is OPT-IN. ReadFile / Transfer stay
+        // OCCT-internal and single-threaded (STEP reader has global state); only
+        // the DFS mesh pass - 39-58% of a real parse - is split across parts.
+        std::vector<XcafMeshTask> meshTasks;
+        std::vector<XcafAppendTask> appendTasks;
+        // 0 = original serial path (default). >0 = worker threads.
+        // CAD_MESH_PARALLEL=1 -> NUMBER_OF_PROCESSORS capped at 32;
+        // an explicit N>1 lets the field compare 1/2/4/... workers.
+        int meshThreads = 0;
+        {
+            const char* envT = std::getenv("CAD_MESH_PARALLEL");
+            if (envT != 0 && *envT != 0)
+            {
+                int req = std::atoi(envT);
+                if (req > 0)
+                {
+                    if (req == 1)
+                    {
+                        const char* envC = std::getenv("NUMBER_OF_PROCESSORS");
+                        int cores = (envC != 0 && *envC != 0) ? std::atoi(envC) : 4;
+                        if (cores < 1) cores = 1;
+                        if (cores > 32) cores = 32;
+                        meshThreads = cores;
+                    }
+                    else meshThreads = req > 32 ? 32 : req;
+                }
+            }
+        }
+        ctx.deferMesh = (meshThreads > 0);
+        ctx.pMeshTasks = &meshTasks;
+        ctx.pAppendTasks = &appendTasks;
+
+        // Split a global budget across the nodes: one part of a 1500-part assembly must not
+        // be meshed as finely as a single-part model, or the totals explode (37.9 M triangles
+        // and a 162 s freeze on a 22 MB file before this existed).
+        int totalNodes = 0;
+        for (int ti = 1; ti <= tops.Length(); ti++)
+            totalNodes += XcafCountNodes(tops.Value(ti), shapeTool);
+        if (totalNodes < 1) totalNodes = 1;
+        // With ~1500 parts the measured split was: transfer ~23 s (OCCT internal, not
+        // tunable from here) and meshing ~21 s. Lowering the triangle budget is the one
+        // lever that actually shortens the meshing pass, so keep it modest.
+        //
+        // NOTE (2026-11-01): the split below is only a *starting share*. MeshAdaptive
+        // raises it for any part whose topology face count needs more (kMinTriPerFace),
+        // because an equal split starves the one large part of a small assembly: on
+        // assemble.stp (200 nodes) the 1035x1114 mm sheet-metal part 6401111 was given
+        // the same 6000 triangles as a 21x43x31 mm bracket and came out with 1.7
+        // triangles per face - its folded top edge rendered as a single skewed facet.
+        const long long kTriBudgetTotal = 4000000;   // triangles for the whole assembly
+        const long long kMsBudgetTotal = 45000;      // meshing time for the whole assembly
+        long long perTri = kTriBudgetTotal / totalNodes;
+        if (perTri < 6000) perTri = 6000;            // never so coarse that a part is a blob
+        if (perTri > 800000) perTri = 800000;
+        long long perMs = kMsBudgetTotal / totalNodes;
+        if (perMs < 40) perMs = 40;
+        if (perMs > 3000) perMs = 3000;
+        ctx.perShapeTris = (int)perTri;
+        ctx.perShapeMs = perMs;
+        ctx.triBudgetTotal = kTriBudgetTotal;
+        ctx.msBudgetTotal = kMsBudgetTotal;
+
+        // Face-weighted share (the values above are only the fallback): walk the tree once
+        // to total the topology faces of every distinct shape, then let each shape claim
+        // budget in proportion. A cheap pre-pass - it reads bounding/serial data only and
+        // never tessellates.
+        ctx.totalTopoFaces = 0;
+        {
+            TopTools_IndexedMapOfShape seenFaces;
+            for (int ti = 1; ti <= tops.Length(); ti++)
+                ctx.totalTopoFaces += XcafCountTopoFacesUnique(tops.Value(ti), shapeTool, seenFaces);
+        }
+
+        stage = "DFS";
+        long long tDfs0 = NowMs();
+        for (int ti = 1; ti <= tops.Length(); ti++)
+        {
+            XcafDfs(tops.Value(ti), -1, TopLoc_Location(), ctx);
+            if (ctx.failed) { error = ctx.err; return -1; }
+        }
+        if (meshThreads > 0)
+        {
+            long long tMesh0 = NowMs();
+            ResolveMeshTasks(meshTasks, meshCache, pEdgeLines, deflEdge, minLen, meshThreads);
+            ctx.meshMs = NowMs() - tMesh0;
+
+            long long tCollect0 = NowMs();
+            for (size_t ai = 0; ai < appendTasks.size(); ++ai)
+            {
+                const XcafAppendTask& at = appendTasks[ai];
+                XcafMeshCache& mc = meshCache[(size_t)(at.slot - 1)];
+                if (!mc.valid) continue;   // mesh failed: same skip as the serial path
+                AppendCachedMesh(mc, at.trsf, pos, idx, pFaceGroup, at.node, pEdgeLines, pEdgeGroups);
+            }
+            ctx.collectMs = NowMs() - tCollect0;
+        }
+        tDfs = NowMs() - tDfs0;
+
+        if (partNames.empty()) { error = "XCAF produced no parts"; return -1; }
+        if (idx.empty() || pos.empty()) { error = "tessellation empty"; return -1; }
+
+        // Per-parse phase timing, ALWAYS appended to a file. A WinForms host has no
+        // console, and gating this behind OCCT_PROBE=1 meant the log silently never
+        // appeared in the field. Cache hits never reach ReadNativeXcaf, so this costs
+        // one short line per genuinely parsed model. ReadFile/Transfer are OCCT-internal
+        // and not tunable from here; DFS covers tessellation + vertex copy.
+        {
+            char stamp[32] = "-";
+            std::time_t nowT = std::time(0);
+            struct tm localTm;
+            if (localtime_s(&localTm, &nowT) == 0)
+                std::strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &localTm);
+
+            const char* s1 = std::strrchr(pathUtf8, '\\');
+            const char* s2 = std::strrchr(pathUtf8, '/');
+            const char* sep = (s1 && s2) ? (s1 > s2 ? s1 : s2) : (s1 ? s1 : s2);
+            const char* base = sep ? sep + 1 : pathUtf8;
+
+            char line[1024];
+            std::snprintf(line, sizeof(line),
+                "%s | %s | total=%lldms read=%lldms transfer=%lldms dfs=%lldms "
+                "(mesh=%lldms collect=%lldms) | nodes=%d uniq=%d tris=%d verts=%d parts=%d par=%d\n",
+                stamp, base,
+                tReadFile + tTransfer + tDfs,
+                tReadFile, tTransfer, tDfs, ctx.meshMs, ctx.collectMs,
+                totalNodes, (int)(ctx.pShapeMap ? ctx.pShapeMap->Extent() : 0),
+                (int)(idx.size() / 3), (int)(pos.size() / 3),
+                (int)partNames.size(), meshThreads);
+
+            // Prefer <exe dir>\log\ (same place as MeshCache). Try the EXE dir and the
+            // current working directory too, so the line is never silently lost when
+            // log\ has not been created yet or the host changed its working directory.
+            std::string candidates[3];
+            int candCount = 0;
+            char exePath[1024] = "";
+            unsigned long n = GetModuleFileNameA(0, exePath, sizeof(exePath));
+            if (n > 0 && n < sizeof(exePath))
+            {
+                char* slash = std::strrchr(exePath, '\\');
+                if (slash)
+                {
+                    slash[1] = 0;
+                    std::string dir(exePath);
+                    candidates[candCount++] = dir + "log\\occt_probe.log";
+                    candidates[candCount++] = dir + "occt_probe.log";
+                }
+            }
+            candidates[candCount++] = "occt_probe.log";
+
+            FILE* flog = 0;
+            for (int ci = 0; ci < candCount; ci++)
+            {
+                if (fopen_s(&flog, candidates[ci].c_str(), "a") == 0 && flog != 0) break;
+                flog = 0;
+            }
+            if (flog != 0) { fprintf(flog, "%s", line); fclose(flog); }
+
+            // stderr is only useful when someone explicitly runs with a console.
+            if (std::getenv("OCCT_PROBE") != 0)
+            {
+                fprintf(stderr, "%s", line);
+                fflush(stderr);
+            }
+        }
+        return 0;
+    }
+    catch (Standard_Failure& ex)
+    {
+        error = "XCAF (" + stage + "): " + (ex.what() ? ex.what() : "");
+        return -1;
+    }
+    catch (const std::exception& e)
+    {
+        error = std::string("XCAF std::exception (") + stage + "): " + (e.what() ? e.what() : "");
+        return -1;
+    }
+    catch (...) { error = "XCAF unknown exception at " + stage; return -1; }
+}
+
+// Forward declaration: ReadNative falls back to ReadNativeFlat, which is defined below it.
+static int ReadNativeFlat(const char* pathUtf8, std::vector<float>& pos, std::vector<int>& idx,
+    std::vector<int>* pFaceGroup, std::vector<float>* pEdgeLines, std::vector<int>* pEdgeGroups,
+    std::vector<std::string>& partNames, std::vector<int>& partParents, std::vector<char>& partHasGeo,
+    std::string& error);
+
+
+// Tries the XCAF reader first (real names + hierarchy); on any failure falls back to the
+// flat solid-grouped reader (names become "Part N", no hierarchy).
+// STEP files carry their schema in the header (FILE_SCHEMA(('...'))). OCCT only handles the
+// geometry schemas; on the analysis schema AP209 (multidisciplinary analysis / FEM data) its
+// STEP reader throws a non-Standard_Failure exception that we can only catch with catch(...)
+// - an access violation caught through /clr's /EHa, which leaves OCCT in an unknown state.
+// Refusing these up front turns a mysterious "unknown exception" into an actionable message
+// and never lets OCCT touch a file it cannot survive. Verified on 21 ATS*.stp samples:
+// every one of them is AP209 and every one of them fails	this way.
+// Returns false + message when the schema is present but not one we can render.
+static bool StepSchemaRenderable(const char* pathUtf8, std::string& error)
+{
+    FILE* f = fopen(pathUtf8, "rb");
+    if (!f) return true;                       // unreadable: let the real reader report it
+    char buf[65536];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    std::string head(buf, n);
+
+    std::string schema;
+    size_t p = head.find("FILE_SCHEMA");
+    if (p != std::string::npos)
+    {
+        size_t a = head.find('\'', p);
+        if (a != std::string::npos)
+        {
+            size_t b = head.find('\'', a + 1);
+            if (b != std::string::npos) schema = head.substr(a + 1, b - a - 1);
+        }
+    }
+    if (schema.empty()) return true;           // no schema line: don't guess, let OCCT try
+
+    static const char* kOk[] = {
+        "AUTOMOTIVE_DESIGN",                   // AP214
+        "CONFIGURATION_CONTROLLED",            // AP203（长名）
+        "CONFIG_CONTROL_DESIGN",               // AP203（短名，AP203e2 之前的老写法）
+        "AP203", "AP214", "AP242",
+        "INTEGRATED_CNC",                      // AP238 machining (geometry-bearing)
+    };
+    // FILE_SCHEMA 的名字大小写并不统一：实测 MONT_PLAINA_MESA__2.stp 写的是
+    // 小写 "automotive_design"（2691 个 ADVANCED_FACE 的合法 AP214 装配），
+    // 大小写敏感比较会把它当成不支持的分析架构而误拒。统一转大写再匹配，
+    // 报错时仍用原始 schema 文本，方便用户对照文件头。
+    std::string upper = schema;
+    for (size_t ci = 0; ci < upper.size(); ++ci)
+        upper[ci] = (char)std::toupper((unsigned char)upper[ci]);
+    for (int i = 0; i < (int)(sizeof(kOk) / sizeof(kOk[0])); ++i)
+        if (upper.find(kOk[i]) != std::string::npos) return true;
+
+    // ASCII only: see the encoding note at the top of this file - a GBK byte of 0x5C inside a
+    // literal would be read as an escape. The host (C#) turns this tag into a Chinese message.
+    error = "unsupported step schema: " + schema
+          + " (only geometry schemas AP203 / AP214 / AP242 can be previewed)";
+    return false;
+}
+
+static int ReadNative(const char* pathUtf8, std::vector<float>& pos, std::vector<int>& idx,
+    std::vector<int>* pFaceGroup, std::vector<float>* pEdgeLines, std::vector<int>* pEdgeGroups,
+    std::vector<std::string>& partNames, std::vector<int>& partParents, std::vector<char>& partHasGeo,
+    std::string& error)
+{
+    // Only .step/.stp carry a schema; .brep/.iges have no such header and skip this check.
+    {
+        std::string lower;
+        for (const char* q = pathUtf8; *q; ++q)
+        {
+            char c = *q;
+            if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+            lower += c;
+        }
+        bool isStep = lower.size() > 4 &&
+            (lower.compare(lower.size() - 5, 5, ".step") == 0 ||
+             lower.compare(lower.size() - 4, 4, ".stp") == 0);
+        if (isStep && !StepSchemaRenderable(pathUtf8, error)) return -1;
+    }
+
+    int rc = ReadNativeXcaf(pathUtf8, pos, idx, pFaceGroup, pEdgeLines, pEdgeGroups,
+                            partNames, partParents, partHasGeo, error);
+    if (rc == 0 && !partNames.empty()) return 0;
+    // Fallback: clear any partial XCAF results and run the flat reader. Keep the reason
+    // XCAF failed so the host can surface it (the flat reader still succeeds, rc stays 0).
+    std::string xcafError = error;
+    // Always trace the XCAF failure reason: without it a silent flat fallback hides
+    // exactly which stage (transfer / DFS / tessellation) broke for exotic files.
+    {
+        std::string reason = xcafError.empty() ? "no parts / empty tessellation" : xcafError;
+        fprintf(stderr, "OCCT reader: XCAF path failed, falling back to flat. reason: %s\n", reason.c_str());
+        fflush(stderr);
+    }
+    pos.clear(); idx.clear();
+    if (pFaceGroup) pFaceGroup->clear();
+    if (pEdgeLines) pEdgeLines->clear();
+    if (pEdgeGroups) pEdgeGroups->clear();
+    partNames.clear(); partParents.clear(); partHasGeo.clear();
+    int rc2 = ReadNativeFlat(pathUtf8, pos, idx, pFaceGroup, pEdgeLines, pEdgeGroups,
+                             partNames, partParents, partHasGeo, error);
+    if (rc2 != 0 && !xcafError.empty())
+        error = "flat reader failed (" + error + "); XCAF had failed too: " + xcafError;
+    else if (!xcafError.empty())
+        error = "XCAF fallback: " + xcafError;
+    return rc2;
+}
+
+static int ReadNativeFlat(const char* pathUtf8, std::vector<float>& pos, std::vector<int>& idx, std::vector<int>* pFaceGroup, std::vector<float>* pEdgeLines, std::vector<int>* pEdgeGroups, std::vector<std::string>& partNames, std::vector<int>& partParents, std::vector<char>& partHasGeo, std::string& error){
+    try
+    {
+        // 扩展名判定（转小写；托管侧已保证路径非空）
+        std::string path(pathUtf8);
+        size_t dot = path.find_last_of('.');
+        std::string ext = (dot == std::string::npos) ? std::string() : path.substr(dot);
+        for (size_t i = 0; i < ext.size(); i++)
+            ext[i] = (char)std::tolower((unsigned char)ext[i]);
+
+        TopoDS_Shape shape;
+        if (IsStepFile(pathUtf8, ext))
+        {
+            STEPControl_Reader reader;
+            if (reader.ReadFile(pathUtf8) != IFSelect_RetDone)
+            {
+                error = "STEP 文件解析失败（ReadFile）";
+                return -1;
+            }
+            if (reader.TransferRoots() <= 0)
+            {
+                error = "STEP 形状转换失败（TransferRoots）";
+                return -1;
+            }
+            shape = reader.OneShape();
+        }
+        else if (IsIgesFile(pathUtf8, ext))
+        {
+            IGESControl_Reader reader;
+            if (reader.ReadFile(pathUtf8) != IFSelect_RetDone)
+            {
+                error = "IGES 文件解析失败（ReadFile）";
+                return -1;
+            }
+            if (reader.TransferRoots() <= 0)
+            {
+                error = "IGES 形状转换失败（TransferRoots）";
+                return -1;
+            }
+            shape = reader.OneShape();
+        }
+        else if (ext == ".brep")
+        {
+            // OCCT 8.0：BRepTools::Read 文件版需显式传 BRep_Builder，返回 bool
+            BRep_Builder builder;
+            if (!BRepTools::Read(shape, pathUtf8, builder) || shape.IsNull())
+            {
+                error = "BREP 文件读取失败";
+                return -1;
+            }
+        }
+        else
+        {
+            error = "OCCTWrapper 仅支持 .step/.stp/.iges/.igs/.brep";
+            return -2;
+        }
+
+        if (shape.IsNull())
+        {
+            error = "解析结果为空形状";
+            return -1;
+        }
+
+        // ================= 三角化质量 / 规模自适应（2026-10-18） =================
+        //
+        // 🔴 质量修正背景（用户实测："大量圆孔都是多边形，看起来很粗糙"）：
+        //   原角度公差 0.4rad = 22.9°，整圆只能切出 360/22.9 ≈ 16 段 —— 直径几十毫米的孔在
+        //   屏幕上就是明显多边形。这是"圆孔变多边形"的直接原因（与抗锯齿无关：MSAA 只平滑
+        //   边缘像素，补不出根本不存在的几何分段）。小孔的分段只受角度公差支配，线性弦高
+        //   （0.2% 整机尺寸）对小特征不起作用，所以调小 deflection 治不了这个病。
+        //
+        // 实测（OCCT 8.0.1 / 本机 RTX A500，读文件+三角化+摊平全流程）：
+        //   linkrods.step  0.4rad→ 5836 tri / 371ms   0.2rad→14418 tri / 415ms   0.15rad→24164 tri / 529ms
+        //   screw.step     0.4rad→ 1306 tri /  36ms   0.2rad→ 1586 tri /  34ms   0.15rad→ 1868 tri /  46ms
+        //   ⇒ 基准取 0.15rad（整圆 42 段）：这是用户实测认可"显示很精细"的那一档，不再下调；
+        //     0.2rad 只有 31 段，肉眼已能看出棱；0.4rad 的 16 段就是"圆孔变多边形"的元凶。
+        //
+        // 三段式自适应（回答"能否按图纸规模自动设置显示参数"）：
+        //   ① 预判：按拓扑面数预估规模，mesh 之前就把起点放粗，避免"先细后推翻"（2026-10-17 首开 50s 事故）；
+        //   ② 反馈：面数或**实测耗时**任一超预算就再放粗——耗时是软件规模最诚实的信号，
+        //          阻尼到"面数×耗时"双指标，最多 3 轮，收益 <20% 且耗时达标即停；
+        //   ③ 提精：规模远低于预算的小图，自动把圆孔再切细一档，大图永远走不到这一步。
+        // 粗化时**角度公差同步放宽**：大总成的面数主要压在圆孔/曲面上，只放大线性弦高压不下来。
+        MeshAdaptive(shape);
+
+        // 分组收集：有 SOLID 的结构按实体分组（前端按部件自动着色）；
+        // 无实体（如 IGES 外壳/复合体）退化为按 SHELL 分组；再无则整体一组。
+        //
+        // 部件列表先建好，三角面与棱边两趟共用：两边必须报同一套组号，查看器才能在
+        // 隐藏某部件时把它的面和轮廓一起藏掉（见 CollectEdges 的 pEdgeGroup）。
+        std::vector<TopoDS_Shape> parts;
+        bool hasSolid = false;
+        for (TopExp_Explorer es(shape, TopAbs_SOLID); es.More(); es.Next())
+        {
+            hasSolid = true;
+            parts.push_back(es.Current());
+        }
+        if (!hasSolid)
+        {
+            bool hasShell = false;
+            for (TopExp_Explorer es(shape, TopAbs_SHELL); es.More(); es.Next())
+            {
+                hasShell = true;
+                parts.push_back(es.Current());
+            }
+            if (!hasShell)
+                parts.push_back(shape);
+        }
+        for (size_t pi = 0; pi < parts.size(); pi++)
+            CollectFaces(parts[pi], pos, idx, pFaceGroup, (int)pi);
+
+        // Real part edges for the translucent view (see CollectEdges). The chord tolerance
+        // follows the model size, so the line count stays proportional to the geometry
+        // instead of to whatever units the file happens to use.
+        // Collected PER PART (same group numbering as the faces): an edge shared by two
+        // parts is emitted once per part, so hiding a part also hides its outline.
+        if (pEdgeLines)
+        {
+            double maxDim = 1.0;
+            Bnd_Box bb;
+            BRepBndLib::Add(shape, bb);
+            if (!bb.IsVoid())
+            {
+                Standard_Real x1, y1, z1, x2, y2, z2;
+                bb.Get(x1, y1, z1, x2, y2, z2);
+                maxDim = std::max(std::max(x2 - x1, y2 - y1), z2 - z1);
+            }
+            double defl = maxDim * 1.5e-4;
+            if (defl < 0.05) defl = 0.05;
+            double minLen = maxDim * 1.2e-3;
+            if (minLen < 0.3) minLen = 0.3;
+            if (pEdgeGroups) pEdgeGroups->clear();
+            for (size_t pi = 0; pi < parts.size(); pi++)
+                CollectEdges(parts[pi], *pEdgeLines, pEdgeGroups, (int)pi, defl, minLen);
+        }
+
+        // Flat fallback part metadata: names left empty (C# shows "部件 N" for empty names),
+        // no hierarchy (all parents -1), every node carries geometry.
+        {
+            int nParts = (int)parts.size();
+            for (int i = 0; i < nParts; i++)
+            {
+                partNames.push_back(std::string());
+                partParents.push_back(-1);
+                partHasGeo.push_back(1);
+            }
+        }
+
+        if (idx.empty() || pos.empty())
+        {
+            error = "三角化结果为空（模型无曲面/实体面）";
+            return -1;
+        }
+        return 0;
+    }
+    catch (Standard_Failure& ex)
+    {
+        error = ex.what();
+        return -1;
+    }
+    // 非 Standard_Failure 的 C++ 异常（std::bad_alloc、MSVC 的结构化异常包装等）以前一律落到
+    // catch(...) 变成"未知异常"，真因永远查不到。这里先把 std::exception 的文本抓出来。
+    catch (const std::exception& e)
+    {
+        error = std::string("std::exception: ") + (e.what() ? e.what() : "");
+        return -1;
+    }
+    catch (...)
+    {
+        error = "OCCT 读取发生未知异常";
+        return -1;
+    }
+}
+#pragma managed(pop)
+
+// ---------------------------------------------------------------------------
+// 托管入口：字符串/数组编组 + 调用原生实现，不直接触碰 OCCT 类型。
+// ---------------------------------------------------------------------------
+namespace Platform { namespace Component { namespace OCCTWrapper {
+
+bool OcctBrepReader::IsAvailable()
+{
+    return true;
+}
+
+int OcctBrepReader::Read(String^ filePath, array<float>^% positions, array<int>^% indices, String^% error)
+{
+    // 旧 API：内部走分组版（忽略组号输出）
+    array<int>^ faceGroups = nullptr;
+    return ReadParts(filePath, positions, indices, faceGroups, error);
+}
+
+int OcctBrepReader::ReadParts(String^ filePath, array<float>^% positions, array<int>^% indices, array<int>^% faceGroups, String^% error)
+{
+    positions = nullptr;
+    indices = nullptr;
+    faceGroups = nullptr;
+    error = nullptr;
+    if (String::IsNullOrEmpty(filePath))
+    {
+        error = "文件路径为空";
+        return -1;
+    }
+
+    try
+    {
+        // 托管字符串 → UTF-8 字符缓冲（OCCT 8.0 文件 API 统一收 const char*，按 UTF-8 解释并在内部转宽字符，中文路径安全）
+        array<unsigned char>^ pathBytes = System::Text::Encoding::UTF8->GetBytes(filePath);
+        pin_ptr<unsigned char> pinnedPath = &pathBytes[0];
+
+        std::vector<float> pos;
+        std::vector<int> idx;
+        std::vector<int> fg;
+        std::vector<std::string> pnames;
+        std::vector<int> pparents;
+        std::vector<char> phasgeo;
+        std::string err;
+        int rc = ReadNative(reinterpret_cast<const char*>(pinnedPath), pos, idx, &fg, nullptr, nullptr, pnames, pparents, phasgeo, err);
+        if (rc != 0)
+        {
+            error = gcnew String(err.empty() ? "读取失败" : err.c_str());
+            return rc;
+        }
+
+        positions = gcnew array<float>((int)pos.size());
+        if (!pos.empty())
+        {
+            pin_ptr<float> dst = &positions[0];
+            memcpy(dst, &pos[0], pos.size() * sizeof(float));
+        }
+        indices = gcnew array<int>((int)idx.size());
+        if (!idx.empty())
+        {
+            pin_ptr<int> dst = &indices[0];
+            memcpy(dst, &idx[0], idx.size() * sizeof(int));
+        }
+        faceGroups = gcnew array<int>((int)fg.size());
+        if (!fg.empty())
+        {
+            pin_ptr<int> dst = &faceGroups[0];
+            memcpy(dst, &fg[0], fg.size() * sizeof(int));
+        }
+        return 0;
+    }
+    catch (System::Exception^ ex)
+    {
+        error = "托管层异常: " + ex->Message;
+        return -1;
+    }
+}
+
+int OcctBrepReader::ReadFlat(String^ filePath, array<float>^% positions, array<int>^% indices, array<int>^% faceGroups, String^% error)
+{
+    positions = nullptr; indices = nullptr; faceGroups = nullptr; error = nullptr;
+    if (String::IsNullOrEmpty(filePath)) { error = "file path empty"; return -1; }
+    try
+    {
+        array<unsigned char>^ pathBytes = System::Text::Encoding::UTF8->GetBytes(filePath);
+        pin_ptr<unsigned char> pinnedPath = &pathBytes[0];
+        std::vector<float> pos; std::vector<int> idx; std::vector<int> fg;
+        std::vector<std::string> pnames; std::vector<int> pparents; std::vector<char> phasgeo;
+        std::string err;
+        int rc = ReadNativeFlat(reinterpret_cast<const char*>(pinnedPath), pos, idx, &fg, nullptr, nullptr, pnames, pparents, phasgeo, err);
+        if (rc != 0) { error = gcnew String(err.empty() ? "read failed" : err.c_str()); return rc; }
+        positions = gcnew array<float>((int)pos.size());
+        if (!pos.empty()) { pin_ptr<float> dst = &positions[0]; memcpy(dst, &pos[0], pos.size() * sizeof(float)); }
+        indices = gcnew array<int>((int)idx.size());
+        if (!idx.empty()) { pin_ptr<int> dst = &indices[0]; memcpy(dst, &idx[0], idx.size() * sizeof(int)); }
+        faceGroups = gcnew array<int>((int)fg.size());
+        if (!fg.empty()) { pin_ptr<int> dst = &faceGroups[0]; memcpy(dst, &fg[0], fg.size() * sizeof(int)); }
+        return 0;
+    }
+    catch (System::Exception^ ex) { error = "managed exception: " + ex->Message; return -1; }
+}
+
+int OcctBrepReader::ReadPartsEx(String^ filePath, array<float>^% positions, array<int>^% indices,
+                                array<int>^% faceGroups, array<float>^% edgeLines,
+                                array<int>^% edgeGroups, array<String^>^% partNames,
+                                array<int>^% partParents, array<bool>^% partHasGeo, String^% error)
+{
+    positions = nullptr;
+    indices = nullptr;
+    faceGroups = nullptr;
+    edgeLines = nullptr;
+    edgeGroups = nullptr;
+    partNames = nullptr;
+    partParents = nullptr;
+    partHasGeo = nullptr;
+    error = nullptr;
+    if (String::IsNullOrEmpty(filePath))
+    {
+        error = "文件路径为空";
+        return -1;
+    }
+
+    try
+    {
+        array<unsigned char>^ pathBytes = System::Text::Encoding::UTF8->GetBytes(filePath);
+        pin_ptr<unsigned char> pinnedPath = &pathBytes[0];
+
+        std::vector<float> pos;
+        std::vector<int> idx;
+        std::vector<int> fg;
+        std::vector<float> ed;
+        std::vector<int> eg;
+        std::vector<std::string> pnames;
+        std::vector<int> pparents;
+        std::vector<char> phasgeo;
+        std::string err;
+        int rc = ReadNative(reinterpret_cast<const char*>(pinnedPath), pos, idx, &fg, &ed, &eg, pnames, pparents, phasgeo, err);
+        if (rc != 0)
+        {
+            error = gcnew String(err.empty() ? "读取失败" : err.c_str());
+            return rc;
+        }
+        // Diagnostic only: rc==0, but err may explain that XCAF fell back to the flat reader.
+        if (!err.empty())
+            error = gcnew String(err.c_str());
+
+        positions = gcnew array<float>((int)pos.size());
+        if (!pos.empty())
+        {
+            pin_ptr<float> dst = &positions[0];
+            memcpy(dst, &pos[0], pos.size() * sizeof(float));
+        }
+        indices = gcnew array<int>((int)idx.size());
+        if (!idx.empty())
+        {
+            pin_ptr<int> dst = &indices[0];
+            memcpy(dst, &idx[0], idx.size() * sizeof(int));
+        }
+        faceGroups = gcnew array<int>((int)fg.size());
+        if (!fg.empty())
+        {
+            pin_ptr<int> dst = &faceGroups[0];
+            memcpy(dst, &fg[0], fg.size() * sizeof(int));
+        }
+        edgeLines = gcnew array<float>((int)ed.size());
+        if (!ed.empty())
+        {
+            pin_ptr<float> dst = &edgeLines[0];
+            memcpy(dst, &ed[0], ed.size() * sizeof(float));
+        }
+        edgeGroups = gcnew array<int>((int)eg.size());
+        if (!eg.empty())
+        {
+            pin_ptr<int> dst = &edgeGroups[0];
+            memcpy(dst, &eg[0], eg.size() * sizeof(int));
+        }
+        // Part tree: names arrive UTF-8 from the file, decode so CJK names render correctly.
+        partNames = gcnew array<String^>((int)pnames.size());
+        for (size_t pi = 0; pi < pnames.size(); pi++)
+        {
+            std::string s = pnames[pi];
+            array<unsigned char>^ bytes = gcnew array<unsigned char>((int)s.size());
+            for (size_t k = 0; k < s.size(); k++) bytes[k] = (unsigned char)s[k];
+            partNames[pi] = System::Text::Encoding::UTF8->GetString(bytes);
+        }
+        partParents = gcnew array<int>((int)pparents.size());
+        if (!pparents.empty())
+        {
+            pin_ptr<int> dst = &partParents[0];
+            memcpy(dst, &pparents[0], pparents.size() * sizeof(int));
+        }
+        partHasGeo = gcnew array<bool>((int)phasgeo.size());
+        for (size_t pi = 0; pi < phasgeo.size(); pi++)
+            partHasGeo[pi] = (phasgeo[pi] != 0);
+        return 0;
+    }
+    catch (System::Exception^ ex)
+    {
+        error = "托管层异常: " + ex->Message;
+        return -1;
+    }
+}
+
+}}}
+
+#else
+// ==================== 占位实现（USE_OCCT 未定义：OCCT 静态库未编入） ====================
+namespace Platform { namespace Component { namespace OCCTWrapper {
+
+bool OcctBrepReader::IsAvailable()
+{
+    return false;
+}
+
+int OcctBrepReader::Read(System::String^ filePath, array<float>^% positions, array<int>^% indices, System::String^% error)
+{
+    positions = nullptr;
+    indices = nullptr;
+    error = "OCCT 封装未编译（占位版）。OCCT 静态库就绪后以 USE_OCCT 宏重新编译 Platform.Component.OCCTWrapper 即启用 STEP/IGES/BREP 预览。";
+    return 1;
+}
+
+int OcctBrepReader::ReadParts(System::String^ filePath, array<float>^% positions, array<int>^% indices, array<int>^% faceGroups, System::String^% error)
+{
+    positions = nullptr;
+    indices = nullptr;
+    faceGroups = nullptr;
+    error = "OCCT 封装未编译（占位版）。OCCT 静态库就绪后以 USE_OCCT 宏重新编译 Platform.Component.OCCTWrapper 即启用 STEP/IGES/BREP 预览。";
+    return 1;
+}
+
+int OcctBrepReader::ReadPartsEx(System::String^ filePath, array<float>^% positions, array<int>^% indices,
+                                array<int>^% faceGroups, array<float>^% edgeLines,
+                                array<int>^% edgeGroups, array<String^>^% partNames,
+                                array<int>^% partParents, array<bool>^% partHasGeo, System::String^% error)
+{
+    positions = nullptr;
+    indices = nullptr;
+    faceGroups = nullptr;
+    edgeLines = nullptr;
+    edgeGroups = nullptr;
+    partNames = nullptr;
+    partParents = nullptr;
+    partHasGeo = nullptr;
+    error = "OCCT 封装未编译（占位版）。OCCT 静态库就绪后以 USE_OCCT 宏重新编译 Platform.Component.OCCTWrapper 即启用 STEP/IGES/BREP 预览。";
+    return 1;
+}
+
+}}}
+#endif
