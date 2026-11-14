@@ -18,7 +18,7 @@ C++/CLI 薄胶层，将 **Open CASCADE Technology (OCCT)** 以**静态链接**�
 | x64（主，v143） | v143 | OCCT **8.0.1** | `D:\VC\OCCT\prebuilt\opencascade-8.0.1-vc14-64\inc` 与 `D:\VC\OCCT\build\win64\vc14\lib`（自编 `TK*.lib` 静态库） |
 | Win32 / XP（v140_xp） | v140_xp | OCCT **7.3** | `D:\VC\OCCT\install_xp73\inc` 与 `D:\VC\OCCT\install_xp73\win32\vc14\lib` |
 
-> 两个 vcxproj **共用同一批 `.cpp/.h`**，仅按目标平台分别构建；程序集名称均为 `Platform.Component.OCCTWrapper`（C# 按简单名称绑定），因此通过**输出目录**区分位数（x64 在 `Components\`，Win32 在 `Components\OCCT_X86\`），不改名。
+> 两个 vcxproj **共用同一批 `.cpp/.h`**，仅按目标平台分别构建；程序集名称均为 `Platform.Component.OCCTWrapper`（C# 按简单名称绑定），因此通过**输出目录**区分位数（x64 在 `Components\OCCT_X64\`，Win32 在 `Components\OCCT_X86\`），不改名。
 
 ## 构建
 
